@@ -37,6 +37,7 @@ AWS Cloud Cost Monitor is a lightweight, serverless solution for keeping track o
 - ☁️ Reports saved to S3 as styled HTML files
 - 📝 All activity logged to CloudWatch
 - 🔐 Credential/permission errors caught and returned with clear messages
+- 📧 Optional email alerts via Amazon SES when budget threshold is exceeded
 
 ---
 
@@ -54,6 +55,8 @@ EventBridge (daily cron)
          ├──► S3 Bucket
          │      ├── cost-reports/cost_report_YYYYMMDD_HHMMSS.html
          │      └── cost-reports/last_run_metadata.json
+         │
+         ├──► Amazon SES  ──► Email alert (if budget exceeded)
          │
          └──► CloudWatch Logs
 ```
@@ -85,6 +88,7 @@ aws-cloud-cost-monitor/
   - `logs:CreateLogGroup`
   - `logs:CreateLogStream`
   - `logs:PutLogEvents`
+  - `ses:SendEmail` *(only required if `SEND_EMAIL=true`)*
 
 ---
 
@@ -196,7 +200,27 @@ Go to **Configuration** → **General configuration** → **Edit**:
 
 ---
 
-### 8. Schedule Daily Runs
+### 8. (Optional) Enable Email Alerts via SES
+
+Skip this step if you don't want email alerts.
+
+1. Go to AWS Console → **Amazon SES** → **Verified identities**
+2. Click **Create identity** → choose **Email address**
+3. Enter the email you want to send **from** and click **Create identity**
+4. Check your inbox and click the verification link AWS sends you
+5. Repeat for the **recipient email** if your account is still in SES sandbox mode
+6. Go back to your Lambda → **Environment variables** and set:
+   - `SEND_EMAIL` = `true`
+   - `FROM_EMAIL` = your verified sender email
+   - `TO_EMAIL` = your recipient email
+   - `SES_REGION` = the region where you verified your SES identities (e.g. `eu-north-1`)
+7. Add `ses:SendEmail` permission to your Lambda IAM role
+
+> ℹ️ New AWS accounts are in **SES sandbox mode** by default, which means both sender and recipient emails must be individually verified. To send to any email address, [request production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html) in the SES console.
+
+---
+
+### 9. Schedule Daily Runs
 
 1. Go to **Configuration** → **Triggers** → **Add trigger**
 2. Select **EventBridge (CloudWatch Events)**
@@ -209,7 +233,7 @@ Go to **Configuration** → **General configuration** → **Edit**:
 
 ---
 
-### 9. Test It
+### 10. Test It
 
 1. Go to your Lambda function → **Test** tab
 2. Create a new test event with an empty JSON body `{}`
@@ -237,9 +261,10 @@ Expected success response:
 | `CHANGE_THRESHOLD_ABSOLUTE` | Minimum $ change to trigger a new report | `10.0` |
 | `CHANGE_THRESHOLD_PERCENT` | Minimum % change to trigger a new report | `15.0` |
 | `RETENTION_DAYS` | Auto-delete reports older than this many days | `30` |
-| `SEND_EMAIL` | Set to `true` to enable SES email alerts (code ready but requires verified SES identities) | `false` |
-| `TO_EMAIL` | Recipient email for alerts (future use) | — |
+| `SEND_EMAIL` | Set to `true` to enable SES email alerts (requires verified SES identities) | `false` |
+| `TO_EMAIL` | Recipient email for budget alerts | — |
 | `FROM_EMAIL` | Sender email for alerts (must be verified in SES) | — |
+| `SES_REGION` | AWS region where SES identities are verified | same as `REGION` |
 
 ---
 
@@ -306,6 +331,12 @@ The HTML report includes:
 
 **`statusCode: 500` — Internal error**
 - Check CloudWatch logs: Lambda → Monitor tab → View CloudWatch logs → latest log stream.
+
+**Email alert not received**
+- Confirm `SEND_EMAIL=true` and both `TO_EMAIL` / `FROM_EMAIL` are set correctly.
+- Check that both email addresses are verified in SES (required in sandbox mode).
+- Make sure your Lambda IAM role has the `ses:SendEmail` permission.
+- Check the SES region — `SES_REGION` must match the region where your identities were verified.
 
 ---
 
