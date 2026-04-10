@@ -6,18 +6,20 @@ import pandas as pd
 from jinja2 import Template
 from botocore.exceptions import ClientError
 import logging
-# ==============================================================
+# =======================================================
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-# ==============================================================
+# =======================================================
 ce_client = boto3.client('ce')
 s3_client = boto3.client('s3')
-# ==============================================================
+ses_client = boto3.client('ses', region_name=os.getenv("SES_REGION", os.getenv("REGION", "eu-north-1")))
+# =======================================================
 REGION = os.getenv("REGION", "eu-north-1")
 BUDGET_THRESHOLD = float(os.getenv("BUDGET_THRESHOLD", 50.0))
 TO_EMAIL = os.getenv("TO_EMAIL")
 FROM_EMAIL = os.getenv("FROM_EMAIL")
 SEND_EMAIL = os.getenv("SEND_EMAIL", "false").lower() == "true"
+SES_REGION = os.getenv("SES_REGION", REGION)
 S3_BUCKET = os.getenv("S3_BUCKET")
 
 # Cost Optimization thresholds
@@ -92,7 +94,6 @@ def cleanup_old_reports():
                     objects_to_delete.append({'Key': key})
 
         if objects_to_delete:
-            # Batch delete (max 1000 per call)
             for i in range(0, len(objects_to_delete), 1000):
                 batch = objects_to_delete[i:i+1000]
                 s3_client.delete_objects(Bucket=S3_BUCKET, Delete={'Objects': batch})
@@ -166,7 +167,6 @@ def get_cost_and_usage(days=30):
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', '')
         if error_code in _CREDENTIAL_ERROR_CODES:
-            # Raise a clear ValueError so lambda_handler can return a 403 with a helpful message
             raise ValueError(
                 f"AWS credentials or permissions error ({error_code}). "
                 "Ensure the Lambda execution role has the 'ce:GetCostAndUsage' permission "
@@ -254,6 +254,75 @@ def generate_html_report(df, total_cost):
     }
 
 
+def send_email_alert(report):
+    """Send a budget alert email via SES when SEND_EMAIL is enabled."""
+    if not SEND_EMAIL:
+        return
+    if not TO_EMAIL or not FROM_EMAIL:
+        logger.warning("SEND_EMAIL is true but TO_EMAIL or FROM_EMAIL is not set — skipping email.")
+        return
+
+    subject = f"🚨 AWS Budget Alert — ${report['total_cost']:.2f} spent in last 30 days"
+
+    report_link = (
+        f"<p><strong>Report:</strong> <a href='{report['report_url']}'>{report['report_url']}</a></p>"
+        if report.get("report_url") else ""
+    )
+
+    body_html = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; color: #333;">
+        <h2 style="color: #d93025;">⚠️ AWS Budget Alert</h2>
+        <p>Your AWS spending has exceeded the configured threshold.</p>
+        <table style="border-collapse: collapse; width: 100%; max-width: 500px;">
+            <tr>
+                <td style="padding: 10px; border: 1px solid #ddd;"><strong>Total Cost (last 30 days)</strong></td>
+                <td style="padding: 10px; border: 1px solid #ddd; color: #d93025;">${report['total_cost']:.2f}</td>
+            </tr>
+            <tr>
+                <td style="padding: 10px; border: 1px solid #ddd;"><strong>Budget Threshold</strong></td>
+                <td style="padding: 10px; border: 1px solid #ddd;">${BUDGET_THRESHOLD:.2f}</td>
+            </tr>
+            <tr>
+                <td style="padding: 10px; border: 1px solid #ddd;"><strong>Report Date</strong></td>
+                <td style="padding: 10px; border: 1px solid #ddd;">{report['report_date']}</td>
+            </tr>
+        </table>
+        {report_link}
+        <p style="color: #777; font-size: 0.9em; margin-top: 30px;">
+            Sent by AWS Cloud Cost Monitor
+        </p>
+    </body>
+    </html>
+    """
+
+    body_text = (
+        f"AWS Budget Alert\n\n"
+        f"Total Cost (last 30 days): ${report['total_cost']:.2f}\n"
+        f"Budget Threshold: ${BUDGET_THRESHOLD:.2f}\n"
+        f"Report Date: {report['report_date']}\n"
+        f"Report URL: {report.get('report_url', 'N/A')}\n"
+    )
+
+    try:
+        ses_client.send_email(
+            Source=FROM_EMAIL,
+            Destination={"ToAddresses": [TO_EMAIL]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {"Data": body_text, "Charset": "UTF-8"},
+                    "Html": {"Data": body_html, "Charset": "UTF-8"},
+                },
+            },
+        )
+        logger.info(f"Budget alert email sent to {TO_EMAIL}")
+    except ClientError as e:
+        logger.error(f"SES email failed: {e.response['Error']['Message']}")
+    except Exception as e:
+        logger.error(f"Unexpected error sending email: {e}")
+
+
 def lambda_handler(event, context):
     logger.info("=== AWS Cloud Cost Monitor Lambda Started ===")
 
@@ -286,6 +355,7 @@ def lambda_handler(event, context):
 
         if report["alert"]:
             logger.warning(f"BUDGET ALERT triggered: ${report['total_cost']} > ${BUDGET_THRESHOLD}")
+            send_email_alert(report)
 
         return {
             "statusCode": 200,
